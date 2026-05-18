@@ -1135,12 +1135,7 @@ spec:
         assert "spec" in task_template
         assert "process" in task_template["spec"]
         command = task_template["spec"]["process"]["command"]
-        assert command[0] == "/bin/sh"
-        assert command[1] == "-c"
-        # Command should contain bootstrap.sh execution
-        # Example: /opt/opensandbox/bin/bootstrap.sh python app.py &
-        assert "/opt/opensandbox/bin/bootstrap.sh python app.py" in command[2]
-        assert command[2].endswith(" &")
+        assert command == ["/opt/opensandbox/bin/bootstrap.sh", "python", "app.py"]
         assert task_template["spec"]["process"]["env"] == [{"name": "FOO", "value": "bar"}]
     
     def test_build_task_template_with_env(self, mock_k8s_client):
@@ -1148,12 +1143,12 @@ spec:
         Test _build_task_template with environment variables.
         
         Verifies:
-        - Command uses shell wrapper: /bin/sh -c "..."
-        - Entrypoint executed via bootstrap.sh in background (&)
+        - Command directly invokes bootstrap.sh
+        - The task-executor shim owns backgrounding and waiting
         - Env list formatted correctly for K8s
         
         Generated command example:
-        /bin/sh -c "/opt/opensandbox/bin/bootstrap.sh /usr/bin/python app.py &"
+        /opt/opensandbox/bin/bootstrap.sh /usr/bin/python app.py
         """
         provider = BatchSandboxProvider(mock_k8s_client)
         
@@ -1168,14 +1163,7 @@ spec:
         
         # Verify command structure
         command = process_task["command"]
-        assert command[0] == "/bin/sh"
-        assert command[1] == "-c"
-        # Should execute via bootstrap.sh in background (&)
-        assert "/opt/opensandbox/bin/bootstrap.sh" in command[2]
-        assert "/usr/bin/python" in command[2]
-        assert "app.py" in command[2]
-        # Should end with & (run in background)
-        assert command[2].endswith("&")
+        assert command == ["/opt/opensandbox/bin/bootstrap.sh", "/usr/bin/python", "app.py"]
         
         # Verify env list
         assert process_task["env"] == [
@@ -1187,10 +1175,10 @@ spec:
         """
         Test _build_task_template without environment variables.
         
-        Verifies command is wrapped in shell and executes via bootstrap.sh in background.
+        Verifies command directly invokes bootstrap.sh.
         
         Generated command example:
-        /bin/sh -c "/opt/opensandbox/bin/bootstrap.sh /usr/bin/python app.py &"
+        /opt/opensandbox/bin/bootstrap.sh /usr/bin/python app.py
         """
         provider = BatchSandboxProvider(mock_k8s_client)
         
@@ -1203,23 +1191,17 @@ spec:
         assert "process" in result["spec"]
         process_task = result["spec"]["process"]
         assert process_task["env"] == []
-        # Without env, command directly calls bootstrap.sh in background
+        # Without env, command directly calls bootstrap.sh
         command = process_task["command"]
-        assert command[0] == "/bin/sh"
-        assert command[1] == "-c"
-        # Check escaped entrypoint
-        assert "/opt/opensandbox/bin/bootstrap.sh" in command[2]
-        assert "/usr/bin/python" in command[2]
-        assert "app.py" in command[2]
-        assert command[2].endswith(" &")
+        assert command == ["/opt/opensandbox/bin/bootstrap.sh", "/usr/bin/python", "app.py"]
     
     def test_build_task_template_uses_default_env_path(self, mock_k8s_client):
         """
         Test that taskTemplate executes bootstrap.sh properly.
         
         Verifies:
-        - Entrypoint is properly escaped
-        - Command runs in background
+        - Entrypoint arguments are preserved
+        - Command does not use a shell-level background operator
         """
         provider = BatchSandboxProvider(mock_k8s_client)
         
@@ -1228,12 +1210,11 @@ spec:
             env={"TEST_VAR": "test_value"}
         )
         
-        command = result["spec"]["process"]["command"][2]
-        # Should execute bootstrap.sh in background
-        assert "/opt/opensandbox/bin/bootstrap.sh" in command
-        assert "python" in command
-        assert "app.py" in command
-        assert command.endswith(" &")
+        assert result["spec"]["process"]["command"] == [
+            "/opt/opensandbox/bin/bootstrap.sh",
+            "python",
+            "app.py",
+        ]
     
     def test_build_task_template_escapes_special_characters(self, mock_k8s_client):
         """
@@ -1249,13 +1230,15 @@ spec:
             env={"KEY": "value with spaces", "QUOTE": "it's fine"}
         )
         
-        command = result["spec"]["process"]["command"][2]
+        command = result["spec"]["process"]["command"]
         
-        # Verify entrypoint args are properly escaped
-        assert "python" in command
-        assert "-c" in command
-        # The python code with spaces and quotes should be properly escaped
-        assert "'print(" in command or '"print(' in command  # Escaped
+        # Verify entrypoint args are preserved without shell interpolation.
+        assert command == [
+            "/opt/opensandbox/bin/bootstrap.sh",
+            "python",
+            "-c",
+            'print("hello world")',
+        ]
         
         # Verify env is passed through env list, not in command
         env_list = result["spec"]["process"]["env"]

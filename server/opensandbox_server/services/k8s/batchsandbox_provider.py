@@ -18,7 +18,6 @@ BatchSandbox-based workload provider implementation.
 
 import logging
 import json
-import shlex
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -509,13 +508,14 @@ class BatchSandboxProvider(WorkloadProvider):
         """
         Build taskTemplate for pool-based BatchSandbox.
         
-        In pool mode, task should use bootstrap.sh to start execd and business process.
+        In pool mode, task should use bootstrap.sh to start execd and the business process.
         
         Generated command example:
-            /bin/sh -c "/opt/opensandbox/bin/bootstrap.sh python app.py &"
-        
-        Note: All entrypoint arguments are properly shell-escaped using shlex.quote
-        to prevent shell injection and preserve arguments with spaces or special characters.
+            /opt/opensandbox/bin/bootstrap.sh python app.py
+
+        The task-executor adds its own process shim, backgrounds this command, and
+        waits for it. Do not append an extra shell-level "&" here: that causes the
+        shim to wait on a short-lived shell instead of the actual sandbox daemon.
         
         Args:
             entrypoint: Container entrypoint command
@@ -524,12 +524,7 @@ class BatchSandboxProvider(WorkloadProvider):
         Returns:
             Dict: taskTemplate specification with TaskSpec structure
         """
-        # Build command: execute bootstrap.sh with entrypoint in background
-        # Use shlex.quote to safely escape each entrypoint argument to prevent shell injection
-        escaped_entrypoint = ' '.join(shlex.quote(arg) for arg in entrypoint)
-        user_process_cmd = f"/opt/opensandbox/bin/bootstrap.sh {escaped_entrypoint} &"
-        
-        wrapped_command = ["/bin/sh", "-c", user_process_cmd]
+        wrapped_command = ["/opt/opensandbox/bin/bootstrap.sh"] + entrypoint
         
         # Convert env dict to k8s EnvVar format
         env_list = [{"name": k, "value": v} for k, v in env.items()] if env else []
