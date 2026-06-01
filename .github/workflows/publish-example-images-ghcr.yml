@@ -1,40 +1,68 @@
 name: Publish Example Images (GHCR)
 
-# Builds the example sandbox container images multi-arch (linux/amd64 + linux/arm64)
-# and publishes them to the GitHub Container Registry under ghcr.io/<owner>/<image>.
+run-name: "Publish example image(s) ${{ inputs.image }}:${{ inputs.tag }} to GHCR"
+
+# Builds the example sandbox images (chrome, desktop, playwright, vscode)
+# multi-arch (linux/amd64 + linux/arm64) and publishes them to
+# ghcr.io/<owner>/<image>:<tag>.
 #
-# Images built here: chrome, desktop, playwright, vscode.
-# Core component images live in publish-images-ghcr.yml.
+# Manual / on-demand only: the example images have no release-tag convention, so
+# this workflow is triggered by hand via the Actions "Run workflow" button.
+# Core component images are released by publish-images-ghcr.yml.
 
 on:
-  push:
-    branches: [main]
-  # TEMPORARY: also build + push on PRs to main so we can validate the workflow
-  # end-to-end. Once validated, delete this `pull_request:` block to build + push
-  # on main only.
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      image:
+        description: 'Example image to build'
+        required: true
+        type: choice
+        options:
+          - all
+          - chrome
+          - desktop
+          - playwright
+          - vscode
+        default: all
+      tag:
+        description: 'Image tag to publish'
+        required: true
+        default: latest
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ inputs.image }}-${{ inputs.tag }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Build image matrix
+        id: set
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.image }}" = "all" ]; then
+            echo 'matrix={"image":["chrome","desktop","playwright","vscode"]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix={"image":["${{ inputs.image }}"]}' >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: setup
     name: ${{ matrix.image }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        image: [chrome, desktop, playwright, vscode]
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -65,9 +93,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha
-            type=ref,event=pr
+            type=raw,value=${{ inputs.tag }}
 
       - name: Build and push
         uses: docker/build-push-action@v6

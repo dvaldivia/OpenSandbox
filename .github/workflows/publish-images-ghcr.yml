@@ -1,21 +1,51 @@
 name: Publish Images (GHCR)
 
-# Builds every core OpenSandbox container image multi-arch (linux/amd64 + linux/arm64)
-# and publishes them to the GitHub Container Registry under ghcr.io/<owner>/<image>.
+run-name: >-
+  Publish ${{ github.event_name == 'workflow_dispatch' && format('{0} {1}', inputs.component, inputs.version) || github.ref_name }} to GHCR
+
+# Builds a single OpenSandbox core component image multi-arch (linux/amd64 +
+# linux/arm64) and publishes it to ghcr.io/<owner>/<component>:<version> (plus
+# :latest) when a component release tag is pushed.
 #
-# Images built here: server, execd, ingress, egress, code-interpreter,
-# controller, task-executor, image-committer.
-# Example sandbox images live in publish-example-images-ghcr.yml.
+# Triggers on the same per-component release tags already consumed by
+# publish-server.yml / publish-components.yml (which push to DockerHub + ACR), so
+# GHCR becomes a parallel mirror with no new tagging conventions:
+#   server/v*               -> server
+#   docker/<component>/v*    -> execd | code-interpreter | ingress | egress
+#   k8s/<component>/v*       -> controller | task-executor | image-committer
+#
+# Example sandbox images are built on demand by publish-example-images-ghcr.yml.
 
 on:
   push:
-    branches: [main]
-  # TEMPORARY: also build + push on PRs to main so we can validate the workflow
-  # end-to-end. Once validated, delete this `pull_request:` block to build + push
-  # on main only.
-  pull_request:
-    branches: [main]
+    tags:
+      - 'server/v*'
+      - 'docker/execd/v*'
+      - 'docker/code-interpreter/v*'
+      - 'docker/ingress/v*'
+      - 'docker/egress/v*'
+      - 'k8s/controller/v*'
+      - 'k8s/task-executor/v*'
+      - 'k8s/image-committer/v*'
   workflow_dispatch:
+    inputs:
+      component:
+        description: 'Component to build'
+        required: true
+        type: choice
+        options:
+          - server
+          - execd
+          - code-interpreter
+          - ingress
+          - egress
+          - controller
+          - task-executor
+          - image-committer
+      version:
+        description: 'Image tag to publish (e.g. v1.2.3)'
+        required: true
+        default: latest
 
 permissions:
   contents: read
@@ -23,51 +53,123 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
   build:
-    name: ${{ matrix.image }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: server
-            context: server
-            dockerfile: server/Dockerfile
-          - image: execd
-            context: .
-            dockerfile: components/execd/Dockerfile
-          - image: ingress
-            context: .
-            dockerfile: components/ingress/Dockerfile
-          - image: egress
-            context: .
-            dockerfile: components/egress/Dockerfile
-          - image: code-interpreter
-            context: sandboxes/code-interpreter
-            dockerfile: sandboxes/code-interpreter/Dockerfile
-          - image: controller
-            context: kubernetes
-            dockerfile: kubernetes/Dockerfile
-            build-args: |
-              PACKAGE=./cmd/controller
-          - image: task-executor
-            context: kubernetes
-            dockerfile: kubernetes/Dockerfile
-            build-args: |
-              PACKAGE=cmd/task-executor/main.go
-              USERID=0
-          - image: image-committer
-            context: kubernetes
-            dockerfile: kubernetes/Dockerfile.image-committer
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+
+      - name: Resolve component and build config
+        id: cfg
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            COMPONENT="${{ inputs.component }}"
+            VERSION="${{ inputs.version }}"
+          else
+            TAG_PATH="${GITHUB_REF#refs/tags/}"
+            case "$TAG_PATH" in
+              server/*)
+                COMPONENT="server"
+                VERSION="${TAG_PATH#server/}"
+                ;;
+              docker/*)
+                rest="${TAG_PATH#docker/}"
+                COMPONENT="${rest%%/*}"
+                VERSION="${rest#*/}"
+                ;;
+              k8s/*)
+                rest="${TAG_PATH#k8s/}"
+                COMPONENT="${rest%%/*}"
+                VERSION="${rest#*/}"
+                ;;
+              *)
+                echo "::error::Unrecognized release tag: ${TAG_PATH}"
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [ -z "${COMPONENT}" ] || [ -z "${VERSION}" ]; then
+            echo "::error::Could not resolve component/version (component='${COMPONENT}' version='${VERSION}')"
+            exit 1
+          fi
+
+          GIT_COMMIT="${GITHUB_SHA}"
+          COMMIT_ID="$(git rev-parse --short HEAD)"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          case "$COMPONENT" in
+            server)
+              CONTEXT="server"
+              DOCKERFILE="server/Dockerfile"
+              ;;
+            execd)
+              CONTEXT="."
+              DOCKERFILE="components/execd/Dockerfile"
+              ;;
+            ingress)
+              CONTEXT="."
+              DOCKERFILE="components/ingress/Dockerfile"
+              ;;
+            egress)
+              CONTEXT="."
+              DOCKERFILE="components/egress/Dockerfile"
+              ;;
+            code-interpreter)
+              CONTEXT="sandboxes/code-interpreter"
+              DOCKERFILE="sandboxes/code-interpreter/Dockerfile"
+              ;;
+            controller)
+              CONTEXT="kubernetes"
+              DOCKERFILE="kubernetes/Dockerfile"
+              ;;
+            task-executor)
+              CONTEXT="kubernetes"
+              DOCKERFILE="kubernetes/Dockerfile"
+              ;;
+            image-committer)
+              CONTEXT="kubernetes"
+              DOCKERFILE="kubernetes/Dockerfile.image-committer"
+              ;;
+            *)
+              echo "::error::Unknown component: ${COMPONENT}"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "component=${COMPONENT}"
+            echo "version=${VERSION}"
+            echo "context=${CONTEXT}"
+            echo "dockerfile=${DOCKERFILE}"
+            echo "build_args<<__ARGS_EOF__"
+            case "$COMPONENT" in
+              execd|ingress|egress)
+                echo "VERSION=${VERSION}"
+                echo "GIT_COMMIT=${GIT_COMMIT}"
+                echo "BUILD_TIME=${BUILD_TIME}"
+                ;;
+              controller)
+                echo "PACKAGE=./cmd/controller"
+                echo "COMMIT_ID=${COMMIT_ID}"
+                echo "BUILD_DATE=${BUILD_TIME}"
+                ;;
+              task-executor)
+                echo "PACKAGE=cmd/task-executor/main.go"
+                echo "USERID=0"
+                echo "COMMIT_ID=${COMMIT_ID}"
+                echo "BUILD_DATE=${BUILD_TIME}"
+                ;;
+            esac
+            echo "__ARGS_EOF__"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Free disk space
         run: |
@@ -89,41 +191,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute build metadata
-        id: bmeta
-        run: |
-          {
-            echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
-            echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "commit_short=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ steps.cfg.outputs.component }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha
-            type=ref,event=pr
+            type=raw,value=${{ steps.cfg.outputs.version }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
+          context: ${{ steps.cfg.outputs.context }}
+          file: ${{ steps.cfg.outputs.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ steps.bmeta.outputs.version }}
-            GIT_COMMIT=${{ github.sha }}
-            BUILD_TIME=${{ steps.bmeta.outputs.build_time }}
-            COMMIT_ID=${{ steps.bmeta.outputs.commit_short }}
-            BUILD_DATE=${{ steps.bmeta.outputs.build_time }}
-            ${{ matrix.build-args }}
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          build-args: ${{ steps.cfg.outputs.build_args }}
+          cache-from: type=gha,scope=${{ steps.cfg.outputs.component }}
+          cache-to: type=gha,mode=max,scope=${{ steps.cfg.outputs.component }}
